@@ -47,6 +47,15 @@
 # Whether to ignore case when searching tokens.
 : ${ZSH_HIGHLIGHT_GRADIENT_IGNORE_CASE:=off}
 
+# Paint the entire buffer with the gradient, regardless of tokenization.
+# When "on", overrides token/auto modes and gradients every character typed.
+: ${ZSH_HIGHLIGHT_GRADIENT_ALL:=off}
+
+# Auto-detect commands and flags to paint, instead of fixed tokens
+# When "on", paint recognized command words and their option flags; leave other
+# text at default. Uses main highlighter's type checker if available.
+: ${ZSH_HIGHLIGHT_GRADIENT_AUTO_COMMANDS:=on}
+
 
 # Return 0 when the highlighter should run
 _zsh_highlight_highlighter_gradient_predicate()
@@ -314,10 +323,18 @@ _zsh_highlight_highlighter_gradient_paint()
   typeset -ga _ZSH_HIGHLIGHT_GRADIENT_SPANS
   _ZSH_HIGHLIGHT_GRADIENT_SPANS=()
 
-  local token
-  for token in "$tokens[@]"; do
-    _zsh_highlight_gradient__for_each_occurrence "$buf" "$token" _zsh_highlight_gradient__collect_span
-  done
+  if [[ ${ZSH_HIGHLIGHT_GRADIENT_ALL} == on ]]; then
+    if (( buflen > 0 )); then
+      _ZSH_HIGHLIGHT_GRADIENT_SPANS+=( 0 $buflen )
+    fi
+  elif [[ ${ZSH_HIGHLIGHT_GRADIENT_AUTO_COMMANDS} == on ]]; then
+    _zsh_highlight_gradient__collect_cmd_flag_spans "$buf"
+  else
+    local token
+    for token in "$tokens[@]"; do
+      _zsh_highlight_gradient__for_each_occurrence "$buf" "$token" _zsh_highlight_gradient__collect_span
+    done
+  fi
 
   # Build a mask of positions to paint
   typeset -A _zsh_highlight_gradient_paint_mask
@@ -383,5 +400,85 @@ _zsh_highlight_gradient__collect_span()
   local -i start0=$1
   local -i end0=$2
   _ZSH_HIGHLIGHT_GRADIENT_SPANS+=($start0 $end0)
+}
+
+# Parse BUFFER to collect spans corresponding to commands and their flags
+_zsh_highlight_gradient__collect_cmd_flag_spans()
+{
+  emulate -L zsh
+  setopt localoptions extendedglob noxtrace noverbose
+  # $1: buffer string
+  local buf=$1
+
+  # Split using the same logic main uses for interactivecomments when off
+  # Keep positions via manual scanning similar to main
+  local -a args
+  args=(${(z)buf})
+  local -i len=${#buf}
+  local -i end_pos=0 start_pos i
+  local last_arg arg next_word=':start::start_of_pipeline:' this_word
+  local -a match
+  local MATCH; integer MBEGIN MEND
+  local -i in_redirection=0
+
+  while (( $#args )); do
+    last_arg=$arg
+    arg=$args[1]
+    shift args
+
+    # Init state
+    if (( in_redirection == 0 )); then
+      this_word=$next_word
+      next_word=':regular:'
+    else
+      (( --in_redirection ))
+    fi
+
+    # Advance start/end positions skipping whitespace from buf
+    [[ "$buf[end_pos+1,-1]" = (#b)(#s)(''([ $'\t']|[\\]$'\n')#)(?|)* ]]
+    integer offset="${#match[1]}"
+    (( start_pos = end_pos + offset ))
+    (( end_pos = start_pos + $#arg ))
+
+    # Determine if this word is a command word
+    local is_command_word=false
+    if [[ $this_word == *':start:'* ]]; then
+      is_command_word=true
+    fi
+
+    # Collect command word span if it's runnable
+    if $is_command_word; then
+      # Try to classify the command using main's checker if available
+      local type
+      if type _zsh_highlight_main__type &>/dev/null; then
+        _zsh_highlight_main__type "$arg" 0
+        type=$REPLY
+      else
+        type=unknown
+      fi
+      if [[ $type != none && $arg != ';' && $arg != $'\n' ]]; then
+        _zsh_highlight_gradient__collect_span $start_pos $end_pos
+        next_word=':regular:'
+      fi
+    else
+      # Not in command position; consider options that start with '-' or '--'
+      if [[ $arg == --* || $arg == -[^[:space:]]* ]]; then
+        _zsh_highlight_gradient__collect_span $start_pos $end_pos
+      fi
+    fi
+
+    # Handle command separators to reset to command position
+    case $arg in
+      '|'|'||'|';'|'&'|'&&'|'|&'|$'\n')
+        next_word=':start:'
+        ;;
+      *)
+        # Keep default transitions like main does for simplicity
+        if $is_command_word; then
+          next_word=':regular:'
+        fi
+        ;;
+    esac
+  done
 }
 
